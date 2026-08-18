@@ -603,6 +603,23 @@ async function createProvider(
 }
 
 /**
+ * Best-effort cleanup of provider resources (e.g. OpenCode server processes).
+ * Dedupes shared instances (scan and judge may be the same object) and never
+ * throws — cleanup failure must not mask the scan's real outcome.
+ */
+async function cleanupProviders(...providers: Array<AgentProvider | undefined>): Promise<void> {
+  for (const p of new Set(providers)) {
+    if (p && typeof p.cleanup === 'function') {
+      try {
+        await p.cleanup();
+      } catch (err) {
+        logDebug(TAG, `Provider cleanup failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  }
+}
+
+/**
  * Validate that the config directory has the required structure.
  * Returns early with a clear error message if anything is missing.
  */
@@ -980,21 +997,68 @@ export async function runScan(args: string[]): Promise<void> {
   const mockJudgeEnv = process.env.AGHAST_MOCK_JUDGE;
   const useMockJudge = !!(mockJudgeEnv && mockJudgeEnv !== 'false');
 
+  // A judge provider without a judge model is a silent no-op — say so, since the
+  // user clearly intended to enable the stage.
+  if (!resolvedJudgeModel && resolvedJudgeProvider) {
+    logWarn(TAG, `A judge provider is configured ("${resolvedJudgeProvider}") but no judge model is set — the judge stage is disabled. Set --judge-model (or AGHAST_JUDGE_MODEL / judge.model) to enable it.`);
+  }
+
   let judgeOptions: JudgeOptions | undefined;
+  // Judge provider instance created separately from the scan's, tracked so it is
+  // cleaned up alongside it. Stays unset when the judge reuses the scan provider
+  // or runs mocked.
+  let judgeProviderInstance: AgentProvider | undefined;
   if (resolvedJudgeModel) {
     const judgeProviderName = resolvedJudgeProvider ?? agentProviderName;
-    let judgeProvider: import('./types.js').AgentProvider;
+    let judgeProvider: AgentProvider;
     if (useMockJudge) {
       logProgress(TAG, `Mock judge provider enabled via AGHAST_MOCK_JUDGE=${mockJudgeEnv}`);
       judgeProvider = await createMockJudgeProvider(resolvedJudgeModel);
     } else if (useMock) {
-      // If scan uses mock, use mock for judge too (tests that set AGHAST_MOCK_AI but not AGHAST_MOCK_JUDGE)
-      logWarn(TAG, 'AGHAST_MOCK_AI is set; judge provider will also use mock (set AGHAST_MOCK_JUDGE to control judge response)');
+      // AGHAST_MOCK_AI guarantees zero network/credential use for the whole
+      // pipeline, so it mocks the judge too — an explicitly configured judge
+      // provider is intentionally inert under it.
+      logWarn(TAG, resolvedJudgeProvider
+        ? `AGHAST_MOCK_AI is set; ignoring configured judge provider "${resolvedJudgeProvider}" — the judge will use the mock provider (set AGHAST_MOCK_JUDGE to control its response)`
+        : 'AGHAST_MOCK_AI is set; judge provider will also use mock (set AGHAST_MOCK_JUDGE to control judge response)');
       judgeProvider = await createMockJudgeProvider(resolvedJudgeModel);
     } else {
-      const jp = createProviderByName(judgeProviderName);
-      await jp.initialize({ apiKey: process.env.ANTHROPIC_API_KEY, model: resolvedJudgeModel });
-      judgeProvider = jp;
+      // Preflight the judge provider the same way the scan provider is
+      // preflighted: config errors before auth errors, and both before the
+      // (expensive) scan starts.
+      if (!getProviderNames().includes(judgeProviderName)) {
+        console.error(
+          formatError(ERROR_CODES.E8002, `Unknown judge agent provider "${judgeProviderName}" (from --judge-provider / AGHAST_JUDGE_PROVIDER / judge.provider). Supported providers: ${getProviderNames().join(', ')}`),
+        );
+        await cleanupProviders(provider);
+        process.exit(1);
+      }
+      // Reuse the scan's provider instance when the judge targets the same
+      // provider — a second instance would duplicate resources (e.g. a second
+      // OpenCode server). runJudge applies the judge model itself, strictly
+      // after the check loop finishes, so sharing the instance is safe.
+      const reuseScanProvider = needsAI && provider !== undefined && judgeProviderName === agentProviderName;
+      try {
+        if (reuseScanProvider) {
+          await provider!.validateModel?.(resolvedJudgeModel);
+          judgeProvider = provider!;
+        } else {
+          // Different provider than the scan's, or a static-only scan with no
+          // scan provider: create and initialize eagerly so a misconfigured
+          // judge fails fast here rather than after the scan has run.
+          const jp = createProviderByName(judgeProviderName);
+          await jp.checkPrerequisites?.();
+          await jp.initialize({ apiKey: process.env.ANTHROPIC_API_KEY, model: resolvedJudgeModel });
+          judgeProviderInstance = jp;
+          judgeProvider = jp;
+        }
+      } catch (err) {
+        console.error(
+          formatError(ERROR_CODES.E8003, `Judge provider "${judgeProviderName}" failed to initialize (check --judge-provider and --judge-model): ${err instanceof Error ? err.message : String(err)}`),
+        );
+        await cleanupProviders(provider, judgeProviderInstance);
+        process.exit(1);
+      }
     }
     judgeOptions = {
       provider: judgeProvider,
@@ -1125,7 +1189,7 @@ export async function runScan(args: string[]): Promise<void> {
     if (outcome.judgeSummary) {
       const js = outcome.judgeSummary;
       const truePos = js.judgedIssues - js.falsePositives - js.uncertainJudgements;
-      console.log(`  Judged:        ${js.judgedIssues} issues: ${truePos} true / ${js.falsePositives} false / ${js.uncertainJudgements} uncertain (judge: ${outcome.judgeModel})`);
+      console.log(`  Judged:        ${js.judgedIssues} issues: ${truePos} true / ${js.falsePositives} false / ${js.uncertainJudgements} uncertain (judge: ${outcome.judgeModel}${outcome.judgeProvider ? ` via ${outcome.judgeProvider}` : ''})`);
     }
     console.log(`  Duration:      ${globalTimer.elapsedStr()}`);
     console.log(`  Results:       ${resolvedOutputPath}`);
@@ -1157,6 +1221,11 @@ export async function runScan(args: string[]): Promise<void> {
         costCoveredBySubscription: outcome.costCoveredBySubscription,
         checks: results.summary.totalChecks,
         issues: results.summary.totalIssues,
+        // Judge attribution only when the judge actually ran (mirrors the
+        // outcome's model list, which includes the judge model in that case).
+        ...(outcome.judgeSummary
+          ? { judgeProvider: outcome.judgeProvider, judgeModel: outcome.judgeModel }
+          : {}),
       };
       await saveScanRecord(record);
     } catch (err) {
@@ -1216,13 +1285,16 @@ export async function runScan(args: string[]): Promise<void> {
     const shouldFail =
       outcome.budgetAborted ||
       (failOnCheckFailure && (results.summary.failedChecks > 0 || results.summary.errorChecks > 0));
+    // process.exit preempts the finally below, so clean up explicitly first
+    // (before closeAllHandlers so cleanup log lines are still captured).
+    await cleanupProviders(provider, judgeProviderInstance);
     await closeAllHandlers();
     process.exit(shouldFail ? 1 : 0);
   } finally {
-    // Clean up provider resources (e.g. OpenCode server process)
-    if (provider && 'cleanup' in provider && typeof provider.cleanup === 'function') {
-      await (provider.cleanup as () => Promise<void>)();
-    }
+    // Clean up provider resources (e.g. OpenCode server processes) on throw
+    // paths. Covers both the scan provider and a separately created judge
+    // provider; cleanupProviders dedupes when they share an instance.
+    await cleanupProviders(provider, judgeProviderInstance);
   }
 }
 

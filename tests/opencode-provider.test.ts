@@ -937,3 +937,119 @@ describe('OpenCodeProvider — token usage enrichment', () => {
     assert.equal(result.tokenUsage!.reportedCost, undefined);
   });
 });
+
+describe('OpenCodeProvider — per-call output schema', () => {
+  const judgeSchema = {
+    type: 'object',
+    properties: {
+      verdict: { type: 'string', enum: ['true_positive', 'false_positive', 'uncertain'] },
+      confidence: { type: 'number', minimum: 0, maximum: 1 },
+      rationale: { type: 'string' },
+    },
+    required: ['verdict', 'confidence', 'rationale'],
+    additionalProperties: false,
+  };
+
+  it('forwards a custom outputSchema to the prompt format', async () => {
+    const client = createMockClient();
+    const provider = new OpenCodeProvider({ _client: client as never });
+    await provider.initialize({ model: 'test-provider/test-model' });
+
+    await provider.executeCheck('judge prompt', '/repo', undefined, { outputSchema: judgeSchema });
+
+    const promptCall = client.calls.prompt[0];
+    assert.deepEqual(promptCall.format, { type: 'json_schema', schema: judgeSchema });
+  });
+
+  it('returns the structured object without parsed for a custom schema', async () => {
+    const verdict = { verdict: 'false_positive', confidence: 0.85, rationale: 'input is validated' };
+    const client = createMockClient({
+      promptResponse: {
+        info: {
+          role: 'assistant',
+          tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
+          structured: verdict,
+        },
+        // In structured mode the text parts are typically empty prose — the
+        // JSON exists only in info.structured.
+        parts: [{ type: 'text', text: '' }],
+      },
+    });
+    const provider = new OpenCodeProvider({ _client: client as never });
+    await provider.initialize({ model: 'test-provider/test-model' });
+
+    const result = await provider.executeCheck('judge prompt', '/repo', undefined, { outputSchema: judgeSchema });
+
+    assert.deepEqual(result.structured, verdict);
+    assert.equal(result.parsed, undefined, 'parsed carries the scan CheckResponse shape only');
+  });
+
+  it('still populates parsed and structured for the default schema', async () => {
+    const client = createMockClient();
+    const provider = new OpenCodeProvider({ _client: client as never });
+    await provider.initialize({ model: 'test-provider/test-model' });
+
+    const result = await provider.executeCheck('scan prompt', '/repo');
+
+    assert.deepEqual(result.parsed, { issues: [] });
+    assert.deepEqual(result.structured, { issues: [] });
+  });
+
+  it('skips scan-shape text parsing on the fallback path for a custom schema', async () => {
+    const client = createMockClient({
+      promptResponse: {
+        info: {
+          role: 'assistant',
+          tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
+          // no `structured` → text fallback
+        },
+        parts: [{ type: 'text', text: '{"verdict":"true_positive","confidence":0.9,"rationale":"real"}' }],
+      },
+    });
+    const provider = new OpenCodeProvider({ _client: client as never });
+    await provider.initialize({ model: 'test-provider/test-model' });
+
+    const result = await provider.executeCheck('judge prompt', '/repo', undefined, { outputSchema: judgeSchema });
+
+    assert.equal(result.parsed, undefined, 'parseAgentResponse only understands the scan shape');
+    assert.equal(result.raw, '{"verdict":"true_positive","confidence":0.9,"rationale":"real"}');
+  });
+});
+
+describe('OpenCodeProvider — validateModel', () => {
+  it('accepts a known provider/model without mutating the configured model', async () => {
+    const client = createMockClient();
+    const provider = new OpenCodeProvider({ _client: client as never });
+    await provider.initialize({ model: 'test-provider/test-model' });
+
+    await provider.validateModel('test-provider/other-model');
+    assert.equal(provider.getModelName(), 'test-provider/test-model', 'validateModel must not mutate provider state');
+  });
+
+  it('rejects a wrong-dialect model string with the parse error', async () => {
+    const client = createMockClient();
+    const provider = new OpenCodeProvider({ _client: client as never });
+    await provider.initialize({ model: 'test-provider/test-model' });
+
+    await assert.rejects(
+      () => provider.validateModel('no-slash'),
+      /Invalid model format "no-slash".*Expected "providerID\/modelID"/,
+    );
+    assert.equal(provider.getModelName(), 'test-provider/test-model');
+  });
+
+  it('rejects an unknown model for a known provider', async () => {
+    const client = createMockClient();
+    const provider = new OpenCodeProvider({ _client: client as never });
+    await provider.initialize({ model: 'test-provider/test-model' });
+
+    await assert.rejects(
+      () => provider.validateModel('test-provider/bogus'),
+      (err: unknown) => {
+        assert.ok(err instanceof FatalProviderError);
+        assert.ok(err.message.includes('bogus'));
+        return true;
+      },
+    );
+  });
+});

@@ -13,7 +13,9 @@
  * - Per-check judge: false opt-out: issue skipped by judge
  * - Static-check issues judged (decision #3)
  * - Judge-stage failure (malformed response): verdict uncertain, check FLAG
- * - Mixed-provider mock: agentProvider.models lists both
+ * - Mixed-provider mock: agentProvider.models scan-only, metadata.judge attribution
+ * - Judge provider preflight: E8002 unknown provider, E8003 init/model failures,
+ *   disabled-stage warning, mock-override warning
  * - SARIF output: properties.judge and flagSource surfaced
  */
 
@@ -359,10 +361,10 @@ describe('CLI judge: malformed response → uncertain', () => {
 describe('CLI judge: mixed provider mock', () => {
   afterEach(cleanupOutput);
 
-  it('agentProvider.models includes both scan model and judge model when issues exist', async () => {
-    // Use failFixtureRepo so there are issues to judge: the judge actually runs
-    // and adds its model to modelsUsed. A PASS scan (no issues) skips the judge
-    // stage entirely and the judge model should NOT appear in the models list.
+  it('agentProvider.models is scan-only; metadata.judge carries the judge pair', async () => {
+    // The judge may run on a different provider than the scan, so its model no
+    // longer joins agentProvider.models — the stage is attributed explicitly in
+    // metadata.judge instead.
     await scopedRun({
       AGHAST_MOCK_AI: failFixtureRepo,
       AGHAST_MOCK_JUDGE: judgeTpFixture,
@@ -374,12 +376,26 @@ describe('CLI judge: mixed provider mock', () => {
     const results = await readResults();
     const ap = results.agentProvider as { name: string; models: string[] };
     assert.ok(ap.models.includes('claude-haiku-4-5'), 'Scan model should be listed');
-    assert.ok(ap.models.includes('claude-opus-4-7'), 'Judge model should be listed');
+    assert.ok(!ap.models.includes('claude-opus-4-7'), 'Judge model should NOT be folded into the scan provider models');
+    const metadata = results.metadata as Record<string, unknown>;
+    assert.deepEqual(metadata.judge, { provider: 'mock', model: 'claude-opus-4-7' });
   });
 
-  it('agentProvider.models does not include judge model on PASS scan (no issues to judge)', async () => {
-    // When the scan produces no issues, the judge stage is skipped entirely.
-    // The judge model should not appear in the models list.
+  it('metadata.judge is absent when no judge is configured', async () => {
+    await scopedRun({
+      AGHAST_MOCK_AI: failFixtureRepo,
+    }, [
+      fixtureRepo, '--config-dir', singleCheckConfigDir,
+      '--model', 'claude-haiku-4-5',
+    ]);
+    const results = await readResults();
+    const metadata = results.metadata as Record<string, unknown> | undefined;
+    assert.equal(metadata?.judge, undefined);
+  });
+
+  it('metadata.judge is present but models excludes the judge model on PASS scan (judge never ran)', async () => {
+    // metadata.judge records the stage *configuration*; the model lists record
+    // actual usage. On a PASS scan the stage is enabled but never executes.
     await scopedRun({
       AGHAST_MOCK_AI: 'true',
       AGHAST_MOCK_JUDGE: 'true',
@@ -392,6 +408,136 @@ describe('CLI judge: mixed provider mock', () => {
     const ap = results.agentProvider as { name: string; models: string[] };
     assert.ok(ap.models.includes('claude-haiku-4-5'), 'Scan model should be listed');
     assert.ok(!ap.models.includes('claude-opus-4-7'), 'Judge model should NOT be listed when judge never ran');
+    const metadata = results.metadata as Record<string, unknown>;
+    assert.deepEqual(metadata.judge, { provider: 'mock', model: 'claude-opus-4-7' });
+  });
+
+  it('history record carries judgeProvider/judgeModel, and models includes the judge model, when the judge ran', async () => {
+    const { mkdtemp, rm, readFile } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const tmpDir = await mkdtemp(join(tmpdir(), 'aghast-judge-history-'));
+    const historyFile = join(tmpDir, 'history.json');
+    try {
+      const { exitCode } = await scopedRun({
+        AGHAST_MOCK_AI: failFixtureRepo,
+        AGHAST_MOCK_JUDGE: judgeTpFixture,
+        AGHAST_HISTORY_FILE: historyFile,
+      }, [
+        fixtureRepo, '--config-dir', singleCheckConfigDir,
+        '--model', 'claude-haiku-4-5',
+        '--judge-model', 'claude-opus-4-7',
+      ]);
+      assert.equal(exitCode, 0);
+      const raw = await readFile(historyFile, 'utf-8');
+      const file = JSON.parse(raw) as { records: Array<Record<string, unknown>> };
+      assert.equal(file.records.length, 1);
+      const rec = file.records[0];
+      assert.equal(rec.judgeProvider, 'mock');
+      assert.equal(rec.judgeModel, 'claude-opus-4-7');
+      const models = rec.models as string[];
+      assert.ok(models.includes('claude-haiku-4-5'), 'history models should include the scan model');
+      assert.ok(models.includes('claude-opus-4-7'), 'history models should include the judge model (stats attribution)');
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Judge provider selection & preflight ────────────────────────────────────
+
+describe('CLI judge: judge provider preflight', () => {
+  afterEach(cleanupOutput);
+
+  it('unknown judge provider exits 1 with E8002 before the scan starts', async () => {
+    // Static-only config: no scan provider is needed, so the judge preflight is
+    // the first provider-related gate hit. AGHAST_MOCK_SARIF bypasses the
+    // Semgrep install requirement.
+    const { exitCode, stdout, stderr } = await scopedRun({
+      AGHAST_MOCK_SARIF: cli3TargetsSarif,
+    }, [
+      fixtureRepo, '--config-dir', semgrepOnlyConfigDir,
+      '--judge-model', 'claude-opus-4-7',
+      '--judge-provider', 'bogus',
+    ]);
+    assert.equal(exitCode, 1);
+    assert.match(stderr, /E8002/);
+    assert.match(stderr, /bogus/);
+    assert.ok(!stdout.includes('Starting scan'), 'scan should not start with an unknown judge provider');
+  });
+
+  it('wrong-dialect judge model for opencode exits 1 with E8003 naming the judge', async () => {
+    // opencode's parseModelString rejects "no-slash" before its binary check,
+    // so this stays hermetic on machines without opencode installed.
+    const { exitCode, stdout, stderr } = await scopedRun({
+      AGHAST_MOCK_SARIF: cli3TargetsSarif,
+    }, [
+      fixtureRepo, '--config-dir', semgrepOnlyConfigDir,
+      '--judge-model', 'no-slash-format',
+      '--judge-provider', 'opencode',
+    ]);
+    assert.equal(exitCode, 1);
+    assert.match(stderr, /E8003/);
+    assert.match(stderr, /Judge provider "opencode" failed to initialize/);
+    assert.match(stderr, /Invalid model format/);
+    assert.ok(!stdout.includes('Starting scan'), 'scan should not start with a wrong-dialect judge model');
+  });
+
+  it('invalid judge model on the reused scan provider exits 1 with E8003 before scanning', async () => {
+    // Same provider for scan and judge → the scan's instance is reused and the
+    // judge model is preflighted against it (validateModel, hermetic via
+    // AGHAST_MOCK_CLAUDE_MODELS + AGHAST_MOCK_LOCAL_LOGIN).
+    const { exitCode, stdout, stderr } = await scopedRun({
+      AGHAST_MOCK_AI: undefined,
+      AGHAST_MOCK_LOCAL_LOGIN: 'true',
+      AGHAST_MOCK_CLAUDE_MODELS: 'haiku,sonnet',
+    }, [
+      fixtureRepo, '--config-dir', singleCheckConfigDir,
+      '--model', 'haiku',
+      '--judge-model', 'junk',
+    ]);
+    assert.equal(exitCode, 1);
+    assert.match(stderr, /E8003/);
+    assert.match(stderr, /junk/);
+    assert.ok(!stdout.includes('Starting scan'), 'scan should not start with an invalid judge model');
+  });
+
+  it('judge provider without a judge model warns that the stage is disabled', async () => {
+    const { exitCode, stdout, stderr } = await scopedRun({
+      AGHAST_MOCK_AI: 'true',
+    }, [
+      fixtureRepo, '--config-dir', singleCheckConfigDir,
+      '--judge-provider', 'claude-code',
+    ]);
+    assert.equal(exitCode, 0);
+    const combined = stdout + stderr;
+    assert.ok(combined.includes('the judge stage is disabled'), 'should warn about the disabled judge stage');
+    const results = await readResults();
+    const metadata = results.metadata as Record<string, unknown> | undefined;
+    assert.equal(metadata?.judge, undefined, 'no judge metadata when the stage never enabled');
+  });
+
+  it('AGHAST_MOCK_AI names the judge provider it overrides', async () => {
+    const { exitCode, stdout, stderr } = await scopedRun({
+      AGHAST_MOCK_AI: failFixtureRepo,
+    }, [
+      fixtureRepo, '--config-dir', singleCheckConfigDir,
+      '--judge-model', 'claude-opus-4-7',
+      '--judge-provider', 'opencode',
+    ]);
+    assert.equal(exitCode, 0);
+    const combined = stdout + stderr;
+    assert.ok(
+      combined.includes('ignoring configured judge provider "opencode"'),
+      'warning should name the overridden judge provider',
+    );
+    const results = await readResults();
+    const metadata = results.metadata as Record<string, unknown>;
+    assert.deepEqual(
+      metadata.judge,
+      { provider: 'mock', model: 'claude-opus-4-7' },
+      'the report must attribute the judge to the provider that actually ran',
+    );
   });
 });
 

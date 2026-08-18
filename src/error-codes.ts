@@ -73,6 +73,8 @@ export const ERROR_CODES = {
   E7201: ec('E7201', 'PR comment posting failed'),
   // E8xxx — Judge stage
   E8001: ec('E8001', 'Judge mock response file not found'),
+  E8002: ec('E8002', 'Unknown judge agent provider'),
+  E8003: ec('E8003', 'Judge provider initialization failed'),
 
   // E9xxx — Internal
   E9001: ec('E9001', 'Fatal internal error'),

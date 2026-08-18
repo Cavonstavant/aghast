@@ -239,13 +239,17 @@ function renderHeader(results: ScanResults): string {
     : escapeHtml(repo.path);
   const branch = repo.branch ? ` <span class="muted">on ${escapeHtml(repo.branch)}</span>` : '';
   const commit = repo.commit ? ` <span class="muted">@ ${escapeHtml(repo.commit.slice(0, 12))}</span>` : '';
+  const judge = results.metadata?.judge
+    ? ` &middot;
+        Judge: ${escapeHtml(results.metadata.judge.provider)} / ${escapeHtml(results.metadata.judge.model)}`
+    : '';
   return `
     <header>
       <h1>aghast Security Scan Report</h1>
       <div class="meta">
         Scan ID: <code>${escapeHtml(results.scanId)}</code> &middot;
         Generated: ${escapeHtml(results.timestamp)} &middot;
-        Provider: ${escapeHtml(results.agentProvider.name)}
+        Provider: ${escapeHtml(results.agentProvider.name)}${judge}
       </div>
       <div class="meta">
         Repository: ${repoLabel}${branch}${commit}

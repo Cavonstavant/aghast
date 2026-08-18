@@ -10,6 +10,7 @@ import { withRetry, defaultIsRetryable, DEFAULT_RETRY, AgentTimeoutError, type R
 import { BudgetExceededError } from './budget.js';
 import { type ScanCostTracker, preflightBudget, recordUsage } from './cost-tracker.js';
 import { type AbortHandle, mapWithConcurrency } from './concurrency.js';
+import { JUDGE_OUTPUT_SCHEMA } from './provider-utils.js';
 
 const TAG = 'judge';
 const DEFAULT_JUDGE_CONCURRENCY = 5;
@@ -43,7 +44,12 @@ export interface JudgeOptions {
    * `DEFAULT_RETRY` (one attempt) applies.
    */
   retry?: RetryOptions;
-  /** Circuit breaker shared with the scan, when retry is enabled. */
+  /**
+   * Circuit breaker for the judge's own calls, when retry is enabled. The judge
+   * gets its own breaker (not the scan's): it may run on a different provider,
+   * and even same-provider it runs strictly after the scan, so scan-time
+   * failures say nothing about provider health now.
+   */
   breaker?: CircuitBreaker;
 }
 
@@ -147,7 +153,9 @@ export async function runJudge(
   const effectiveConcurrency = options.concurrency ?? DEFAULT_JUDGE_CONCURRENCY;
   const judgeModel = options.model;
 
-  // Apply per-check model
+  // Apply the judge model. When the judge shares the scan's provider instance,
+  // this is safe only because the judge stage runs strictly after the check
+  // loop (and its applyPerCheckModel/restoreModel pairs) has completed.
   options.provider.setModel?.(judgeModel);
 
   logProgress(TAG, `Judging ${issues.length} issues (model: ${judgeModel}, concurrency: ${effectiveConcurrency})`);
@@ -191,7 +199,9 @@ export async function runJudge(
         const judgeOnce = async (): Promise<AgentResponse> => {
           let timeoutHandle: NodeJS.Timeout | undefined;
           return Promise.race([
-            options.provider.executeCheck(prompt, repositoryPath, `[judge:${issue.checkId}]`),
+            options.provider.executeCheck(prompt, repositoryPath, `[judge:${issue.checkId}]`, {
+              outputSchema: JUDGE_OUTPUT_SCHEMA,
+            }),
             new Promise<never>((_, reject) => {
               timeoutHandle = setTimeout(
                 () => reject(new JudgeTimeoutError(DEFAULT_JUDGE_TIMEOUT_MS / 1000)),
@@ -219,7 +229,13 @@ export async function runJudge(
 
         recordUsage(costTracker, agentResponse.tokenUsage, judgeModel);
 
-        const parsed = parseJudgeResponse(agentResponse.raw);
+        // Prefer the structured-output object (providers running in json_schema
+        // mode put the verdict there; OpenCode's `raw` is empty prose in that
+        // mode). parseJudgeResponse stays the single validation gate either way.
+        const judgeRaw = agentResponse.structured !== undefined
+          ? JSON.stringify(agentResponse.structured)
+          : agentResponse.raw;
+        const parsed = parseJudgeResponse(judgeRaw);
         if (!parsed) {
           logDebug(TAG, `Judge returned malformed response for ${issue.checkId}@${issue.file}:${issue.startLine}`);
           issue.judge = {

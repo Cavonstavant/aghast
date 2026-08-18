@@ -5,6 +5,7 @@ import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   runMultiScan,
+  runMultiScanWithCost,
   generateScanId,
   sumTokenUsage,
 } from '../src/scan-runner.js';
@@ -1842,5 +1843,118 @@ describe('sumTokenUsage', () => {
     ]);
     assert.ok(result);
     assert.equal(result!.inputTokens, 100);
+  });
+});
+
+// --- Judge stage: provider separation ---
+
+function makeStubJudgeProvider(verdict: Record<string, unknown>): AgentProvider {
+  return {
+    async initialize() {},
+    async executeCheck() {
+      return { raw: JSON.stringify(verdict), structured: verdict };
+    },
+    async validateConfig() {
+      return true;
+    },
+  };
+}
+
+describe('runMultiScanWithCost (judge stage: provider separation)', () => {
+  const issueResponse: CheckResponse = {
+    issues: [{ file: 'src/example.ts', startLine: 4, endLine: 4, description: 'SQL injection' }],
+  };
+  const tpVerdict = { verdict: 'true_positive', confidence: 0.9, rationale: 'confirmed' };
+
+  it('judge gets its own circuit breaker — a scan-time outage does not poison judge verdicts', async () => {
+    // Check A succeeds and yields one issue; check B then exhausts its retry
+    // attempts with a retryable 503, opening the scan breaker (threshold 1 —
+    // the breaker counts one failure per exhausted withRetry call). With a
+    // shared breaker the judge call would fail fast with CircuitOpenError and
+    // degrade the verdict to uncertain; with its own breaker the healthy judge
+    // provider still produces a real verdict.
+    let scanCalls = 0;
+    const scanProvider: AgentProvider = {
+      async initialize() {},
+      async executeCheck() {
+        scanCalls++;
+        if (scanCalls === 1) {
+          return { raw: JSON.stringify(issueResponse), parsed: issueResponse };
+        }
+        throw Object.assign(new Error('mock transient outage'), { status: 503 });
+      },
+      async validateConfig() {
+        return true;
+      },
+    };
+
+    const outcome = await runMultiScanWithCost({
+      repositoryPath: fixtureRepo,
+      checks: [
+        makeCheckAndDetails('check-a', 'Check A'),
+        makeCheckAndDetails('check-b', 'Check B'),
+      ],
+      agentProvider: scanProvider,
+      retry: { maxAttempts: 2, baseDelayMs: 1, maxDelayMs: 2, circuitBreakerThreshold: 1 },
+      judge: {
+        provider: makeStubJudgeProvider(tpVerdict),
+        providerName: 'stub-judge',
+        model: 'judge-model',
+      },
+    });
+
+    const checkB = outcome.results.checks.find((c) => c.checkId === 'check-b');
+    assert.equal(checkB?.status, 'ERROR', 'check B should exhaust the scan breaker');
+    assert.equal(outcome.results.issues.length, 1);
+    const judge = outcome.results.issues[0].judge;
+    assert.equal(judge?.verdict, 'true_positive', 'judge must not inherit the scan breaker state');
+    assert.ok(!(judge?.rationale ?? '').includes('Circuit'), 'no CircuitOpenError leakage into the verdict');
+  });
+
+  it('attaches metadata.judge and keeps agentProvider.models scan-only', async () => {
+    const scanProvider = new MockAgentProvider({ response: issueResponse });
+    const outcome = await runMultiScanWithCost({
+      repositoryPath: fixtureRepo,
+      checks: [makeSqlCheck()],
+      agentProvider: scanProvider,
+      agentProviderName: 'claude-code',
+      modelName: 'scan-model',
+      judge: {
+        provider: makeStubJudgeProvider(tpVerdict),
+        providerName: 'opencode',
+        model: 'openrouter/deepseek/deepseek-chat',
+      },
+    });
+
+    assert.deepEqual(outcome.results.metadata?.judge, {
+      provider: 'opencode',
+      model: 'openrouter/deepseek/deepseek-chat',
+    });
+    assert.deepEqual(outcome.results.agentProvider.models, ['scan-model'], 'report models are scan-stage-only');
+    assert.ok(outcome.models.includes('scan-model'));
+    assert.ok(outcome.models.includes('openrouter/deepseek/deepseek-chat'), 'outcome models include the judge model when it ran');
+    assert.equal(outcome.judgeProvider, 'opencode');
+    assert.equal(outcome.judgeModel, 'openrouter/deepseek/deepseek-chat');
+  });
+
+  it('metadata.judge is present but outcome.models excludes the judge model when nothing was judged', async () => {
+    const outcome = await runMultiScanWithCost({
+      repositoryPath: fixtureRepo,
+      checks: [makeSqlCheck()],
+      agentProvider: createPassProvider(),
+      agentProviderName: 'claude-code',
+      modelName: 'scan-model',
+      judge: {
+        provider: makeStubJudgeProvider(tpVerdict),
+        providerName: 'opencode',
+        model: 'openrouter/deepseek/deepseek-chat',
+      },
+    });
+
+    assert.deepEqual(outcome.results.metadata?.judge, {
+      provider: 'opencode',
+      model: 'openrouter/deepseek/deepseek-chat',
+    }, 'metadata.judge records the stage configuration even when no issues were judged');
+    assert.ok(!outcome.models.includes('openrouter/deepseek/deepseek-chat'), 'judge model absent from usage when the judge never ran');
   });
 });

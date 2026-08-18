@@ -368,6 +368,15 @@ export interface ScanMetadata {
     totalCostUsd: number;
     currency: string;
   };
+  /**
+   * Judge stage attribution, attached when the LLM judge stage is enabled.
+   * Kept separate from `agentProvider` (which is scan-stage-only) because the
+   * judge may run on a different provider and model than the scan.
+   */
+  judge?: {
+    provider: string;
+    model: string;
+  };
 }
 
 export interface RepositoryInfo {
@@ -538,7 +547,25 @@ export interface ProviderConfig {
 export interface AgentResponse {
   raw: string;
   parsed?: CheckResponse;
+  /**
+   * Verbatim structured-output object when the provider ran in json_schema mode.
+   * Unlike `parsed` (always the scan's CheckResponse shape), this carries whatever
+   * shape the call's `outputSchema` requested — e.g. the judge's verdict object.
+   * Some providers (OpenCode) return the JSON only here, with prose in `raw`.
+   */
+  structured?: unknown;
   tokenUsage?: TokenUsage;
+}
+
+/** Per-call options for AgentProvider.executeCheck. */
+export interface ExecuteCheckOptions {
+  maxTurns?: number;
+  /**
+   * JSON schema for structured output. Omitted → the scan's OUTPUT_SCHEMA.
+   * Callers passing a custom schema must read `AgentResponse.structured`
+   * (or `raw`), never `parsed`.
+   */
+  outputSchema?: Record<string, unknown>;
 }
 
 /** Describes a single model exposed by a provider's `listModels()`. */
@@ -557,7 +584,7 @@ export interface AgentProvider {
     instructions: string,
     repositoryPath: string,
     logPrefix?: string,
-    options?: { maxTurns?: number },
+    options?: ExecuteCheckOptions,
   ): Promise<AgentResponse>;
   validateConfig(): Promise<boolean>;
   /**
@@ -578,6 +605,12 @@ export interface AgentProvider {
   cleanup?(): Promise<void>;
   /** Closed list of models this provider accepts. Used by `aghast build-config`. */
   listModels?(): Promise<readonly ProviderModelInfo[]>;
+  /**
+   * Validate that `model` is acceptable to this provider WITHOUT changing provider
+   * state (unlike setModel). Throws a descriptive error when it is not. Used to
+   * preflight the judge model against a provider instance shared with the scan.
+   */
+  validateModel?(model: string): Promise<void>;
 }
 
 /**

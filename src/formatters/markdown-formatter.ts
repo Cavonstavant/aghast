@@ -212,6 +212,9 @@ function renderHeader(results: ScanResults): string {
     ? results.agentProvider.models.join(', ')
     : '(none)';
   lines.push(`- **Agent provider:** ${results.agentProvider.name} (model: ${models})`);
+  if (results.metadata?.judge) {
+    lines.push(`- **Judge:** ${results.metadata.judge.provider} (model: ${results.metadata.judge.model})`);
+  }
   lines.push('');
   lines.push(...renderRepository(results.repository));
   return lines.join('\n');

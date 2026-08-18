@@ -6,8 +6,10 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseJudgeResponse, applyJudgeResults } from '../src/judge.js';
-import type { SecurityIssue, CheckExecutionSummary } from '../src/types.js';
+import { parseJudgeResponse, applyJudgeResults, runJudge } from '../src/judge.js';
+import type { AgentProvider, AgentResponse, ExecuteCheckOptions, SecurityIssue, CheckExecutionSummary } from '../src/types.js';
+import { createCostTracker } from '../src/cost-tracker.js';
+import { JUDGE_OUTPUT_SCHEMA } from '../src/provider-utils.js';
 
 // ─── parseJudgeResponse ───────────────────────────────────────────────────────
 
@@ -236,5 +238,105 @@ describe('applyJudgeResults', () => {
     assert.equal(filteredIssues.length, 1);
     assert.equal(summary1.status, 'PASS');
     assert.equal(summary2.status, 'FAIL');
+  });
+});
+
+// ─── runJudge ─────────────────────────────────────────────────────────────────
+
+function makeStubProvider(respond: () => AgentResponse) {
+  const calls: Array<{ prompt: string; options?: ExecuteCheckOptions }> = [];
+  const events: string[] = [];
+  const provider: AgentProvider = {
+    async initialize() {},
+    async executeCheck(instructions, _repositoryPath, _logPrefix, options) {
+      events.push('executeCheck');
+      calls.push({ prompt: instructions, options });
+      return respond();
+    },
+    async validateConfig() {
+      return true;
+    },
+    setModel(model: string) {
+      events.push(`setModel:${model}`);
+    },
+  };
+  return { provider, calls, events };
+}
+
+function makeChecksById(): Map<string, { check: { judge?: boolean }; instructions: string | undefined }> {
+  return new Map([['check-1', { check: {}, instructions: undefined }]]);
+}
+
+describe('runJudge', () => {
+  it('passes JUDGE_OUTPUT_SCHEMA to executeCheck and sets the judge model first', async () => {
+    const { provider, calls, events } = makeStubProvider(() => ({
+      raw: JSON.stringify({ verdict: 'true_positive', confidence: 0.9, rationale: 'real' }),
+    }));
+    const issue = makeIssue();
+
+    await runJudge([issue], makeChecksById(), '/repo', {
+      provider,
+      providerName: 'stub',
+      model: 'judge-model',
+    }, createCostTracker({}));
+
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0].options?.outputSchema, JUDGE_OUTPUT_SCHEMA);
+    assert.equal(events[0], 'setModel:judge-model', 'judge model must be applied before the first call');
+    assert.equal(issue.judge?.verdict, 'true_positive');
+    assert.equal(issue.judge?.provider, 'stub');
+    assert.equal(issue.judge?.model, 'judge-model');
+  });
+
+  it('parses the verdict from AgentResponse.structured when raw is empty prose', async () => {
+    // OpenCode regression: in structured-output mode the JSON exists only in
+    // `structured`; the text parts (raw) are empty.
+    const { provider } = makeStubProvider(() => ({
+      raw: '',
+      structured: { verdict: 'false_positive', confidence: 0.8, rationale: 'validated upstream' },
+    }));
+    const issue = makeIssue();
+
+    await runJudge([issue], makeChecksById(), '/repo', {
+      provider,
+      providerName: 'stub',
+      model: 'judge-model',
+    }, createCostTracker({}));
+
+    assert.equal(issue.judge?.verdict, 'false_positive');
+    assert.equal(issue.judge?.confidence, 0.8);
+    assert.equal(issue.judge?.rationale, 'validated upstream');
+  });
+
+  it('falls back to raw when structured is absent', async () => {
+    const { provider } = makeStubProvider(() => ({
+      raw: 'Analysis: {"verdict":"uncertain","confidence":0.4,"rationale":"unclear"}',
+    }));
+    const issue = makeIssue();
+
+    await runJudge([issue], makeChecksById(), '/repo', {
+      provider,
+      providerName: 'stub',
+      model: 'judge-model',
+    }, createCostTracker({}));
+
+    assert.equal(issue.judge?.verdict, 'uncertain');
+  });
+
+  it('degrades to uncertain with an error rationale when nothing parses', async () => {
+    const { provider } = makeStubProvider(() => ({
+      raw: 'no json here',
+    }));
+    const issue = makeIssue();
+
+    await runJudge([issue], makeChecksById(), '/repo', {
+      provider,
+      providerName: 'stub',
+      model: 'judge-model',
+    }, createCostTracker({}));
+
+    assert.equal(issue.judge?.verdict, 'uncertain');
+    assert.equal(issue.judge?.confidence, 0);
+    assert.match(issue.judge?.rationale ?? '', /judge failed: malformed response/);
   });
 });

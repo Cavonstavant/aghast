@@ -11,7 +11,7 @@ import { existsSync, rmSync } from 'node:fs';
 import { rm as rmAsync } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import type { AgentProvider, AgentResponse, ProviderConfig, CheckResponse, ProviderModelInfo, TokenUsage } from './types.js';
+import type { AgentProvider, AgentResponse, ExecuteCheckOptions, ProviderConfig, CheckResponse, ProviderModelInfo, TokenUsage } from './types.js';
 import { FatalProviderError } from './types.js';
 import { parseAgentResponse } from './response-parser.js';
 import { OUTPUT_SCHEMA } from './provider-utils.js';
@@ -217,7 +217,7 @@ export class OpenCodeProvider implements AgentProvider {
     // Skip server startup if a mock client was injected via constructor
     if (this._client) {
       logDebug(TAG, 'Using injected client (test mode)');
-      await this.validateModel();
+      await this.validateModelIds(this.providerID, this.modelID);
       logDebug(TAG, `Provider initialized with model ${this.providerID}/${this.modelID}`);
       return;
     }
@@ -248,7 +248,7 @@ export class OpenCodeProvider implements AgentProvider {
     }
 
     try {
-      await this.validateModel();
+      await this.validateModelIds(this.providerID, this.modelID);
     } catch (err) {
       this.cleanupSync();
       throw err;
@@ -256,7 +256,20 @@ export class OpenCodeProvider implements AgentProvider {
     logDebug(TAG, `Provider initialized with model ${this.providerID}/${this.modelID}`);
   }
 
-  private async validateModel(): Promise<void> {
+  /**
+   * Validate a "providerID/modelID" string without changing provider state.
+   * Throws the parse error for a wrong-dialect model string before any server
+   * round trip, so it is safe to call for preflight (e.g. the judge model).
+   */
+  async validateModel(model: string): Promise<void> {
+    const { providerID, modelID } = parseModelString(model);
+    if (!this._client) {
+      throw new Error('OpenCode provider not initialized — call initialize() first');
+    }
+    await this.validateModelIds(providerID, modelID);
+  }
+
+  private async validateModelIds(providerID: string, modelID: string): Promise<void> {
     type ProviderInfo = { id: string; name: string; models?: Record<string, { name?: string }> };
 
     const client = this._client!;
@@ -264,20 +277,20 @@ export class OpenCodeProvider implements AgentProvider {
     const data = result.data as { providers?: ProviderInfo[] } | undefined;
     const providers = data?.providers ?? [];
 
-    const provider = providers.find(p => p.id === this.providerID);
+    const provider = providers.find(p => p.id === providerID);
     if (!provider) {
       const available = providers.map(p => p.id).join(', ') || '(none)';
       throw new FatalProviderError(
-        `OpenCode provider "${this.providerID}" not found. Available providers: ${available}. Run 'opencode' and use /connect to configure providers.`,
+        `OpenCode provider "${providerID}" not found. Available providers: ${available}. Run 'opencode' and use /connect to configure providers.`,
       );
     }
 
     const models = provider.models ? Object.keys(provider.models) : [];
-    if (models.length > 0 && !models.includes(this.modelID)) {
-      const availableModels = models.map(m => `${this.providerID}/${m}`).join(', ');
+    if (models.length > 0 && !models.includes(modelID)) {
+      const availableModels = models.map(m => `${providerID}/${m}`).join(', ');
       const availableProviders = providers.map(p => p.id).join(', ') || '(none)';
       throw new FatalProviderError(
-        `Model "${this.modelID}" not found for provider "${this.providerID}". Available models: ${availableModels}. Available providers: ${availableProviders}.`,
+        `Model "${modelID}" not found for provider "${providerID}". Available models: ${availableModels}. Available providers: ${availableProviders}.`,
       );
     }
   }
@@ -421,7 +434,7 @@ export class OpenCodeProvider implements AgentProvider {
     instructions: string,
     repositoryPath: string,
     logPrefix?: string,
-    _options?: { maxTurns?: number },
+    options?: ExecuteCheckOptions,
   ): Promise<AgentResponse> {
     if (!this._client) {
       throw new Error('OpenCode provider not initialized — call initialize() first');
@@ -434,7 +447,7 @@ export class OpenCodeProvider implements AgentProvider {
     // we remove when the scan finishes (refcounted across parallel targets).
     await this.ensureProjectMarker(repositoryPath);
     try {
-      return await this.executeCheckInner(instructions, repositoryPath, logPrefix);
+      return await this.executeCheckInner(instructions, repositoryPath, logPrefix, options);
     } finally {
       await this.releaseProjectMarker(repositoryPath);
     }
@@ -444,6 +457,7 @@ export class OpenCodeProvider implements AgentProvider {
     instructions: string,
     repositoryPath: string,
     logPrefix?: string,
+    options?: ExecuteCheckOptions,
   ): Promise<AgentResponse> {
     const client = this._client!;
     const timer = createTimer();
@@ -594,7 +608,7 @@ export class OpenCodeProvider implements AgentProvider {
         parts: [{ type: 'text' as const, text: instructions }],
         format: {
           type: 'json_schema' as const,
-          schema: OUTPUT_SCHEMA,
+          schema: options?.outputSchema ?? OUTPUT_SCHEMA,
         },
         directory: repositoryPath,
       }, {
@@ -713,14 +727,22 @@ export class OpenCodeProvider implements AgentProvider {
       logDebug(TAG, `${prefix}Token usage: ${inputTokens} in, ${outputTokens} out${reasoningTokens !== undefined ? `, ${reasoningTokens} reasoning` : ''}${cacheReadInputTokens !== undefined ? `, ${cacheReadInputTokens} cache-read` : ''}${cacheCreationInputTokens !== undefined ? `, ${cacheCreationInputTokens} cache-write` : ''}${reportedCost !== undefined ? `, $${reportedCost.amountUsd} reported` : ''}`);
     }
 
-    // Try structured output first (v2 API: info.structured)
+    // Try structured output first (v2 API: info.structured). In structured mode
+    // the JSON lives only here — the text parts are typically empty prose — so
+    // callers with a custom outputSchema must read `structured`, not `raw`.
     if (info?.structured) {
-      const structuredOutput = info.structured as CheckResponse;
-      logDebug(TAG, `${prefix}Structured output: ${structuredOutput.issues?.length ?? 0} issues`);
+      const structuredOutput: unknown = info.structured;
+      const issues = (structuredOutput as { issues?: unknown }).issues;
+      logDebug(TAG, `${prefix}Structured output received${Array.isArray(issues) ? `: ${issues.length} issues` : ''}`);
       logDebugFull(TAG, `${prefix}Full AI response (structured)`, JSON.stringify(structuredOutput, null, 2));
       logProgress(TAG, `${prefix}Completed in ${timer.elapsedStr()} (${toolCallCount} tool calls)`);
       const rawText = extractTextFromParts(parts);
-      return { raw: rawText, parsed: structuredOutput, tokenUsage };
+      return {
+        raw: rawText,
+        structured: structuredOutput,
+        ...(options?.outputSchema ? {} : { parsed: structuredOutput as CheckResponse }),
+        tokenUsage,
+      };
     }
 
     // Fallback: extract text from response parts and parse with response-parser
@@ -731,6 +753,13 @@ export class OpenCodeProvider implements AgentProvider {
 
     if (!rawText) {
       throw new Error('OpenCode AI returned no text response');
+    }
+
+    // parseAgentResponse only understands the scan's {issues: []} shape; callers
+    // with a custom schema (e.g. the judge) parse `raw` themselves on this path.
+    if (options?.outputSchema) {
+      logProgress(TAG, `${prefix}Completed in ${timer.elapsedStr()} (${toolCallCount} tool calls)`);
+      return { raw: rawText, tokenUsage };
     }
 
     const parsed = parseAgentResponse(rawText);
