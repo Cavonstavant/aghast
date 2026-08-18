@@ -209,9 +209,13 @@ Two consequences worth planning for:
   adds 3 judge calls; one producing 200 adds 200. A noisy check set is
   disproportionately more expensive to judge than a quiet one.
 - **Use a cheaper judge model if cost matters.** `--judge-model` is independent
-  of `--model`, so the judge can run on a smaller model than the scan. Judging is
-  a narrower task than discovery — it re-evaluates a single finding with its
-  snippet and the check's instructions.
+  of `--model` — and `--judge-provider` of `--agent-provider` — so the judge can
+  run on a smaller model, or on an entirely different provider, than the scan.
+  Judging is a narrower task than discovery — it re-evaluates a single finding
+  with its snippet and the check's instructions. When the judge ran, its
+  provider and model are recorded in the report (`metadata.judge`) and in scan
+  history (`judgeProvider` / `judgeModel`), and the judge model appears in the
+  history's `models` list for `aghast stats` attribution.
 
 To exclude a specific check's findings from judging entirely, set
 `"judge": false` on its Layer 1 entry — useful for a high-volume check whose

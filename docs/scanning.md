@@ -285,6 +285,25 @@ aghast scan ./my-repo --config-dir ./checks \
   --judge-drop-false-positives
 ```
 
+### Using a different provider for the judge
+
+Pass `--judge-provider` (or `AGHAST_JUDGE_PROVIDER`, or `judge.provider` in runtime config) to run the judge on a different agent provider than the scan — for example a cheap OpenCode-routed model finding candidates and a stronger Claude model adjudicating them, or the reverse:
+
+```bash
+aghast scan ./my-repo --config-dir ./checks \
+  --agent-provider opencode --model openrouter/deepseek/deepseek-chat \
+  --judge-provider claude-code --judge-model claude-opus-4-7
+```
+
+Things to know:
+
+- **The judge model must use the judge provider's model dialect.** OpenCode models are `providerID/modelID` strings (e.g. `openrouter/deepseek/deepseek-chat`); Claude Code models are bare model ids (e.g. `claude-opus-4-7`). A judge model in the wrong dialect fails preflight with error `E8003` before the scan starts.
+- **Misconfiguration fails fast.** An unknown `--judge-provider` exits with `E8002`, and a judge provider or model that fails initialization/validation exits with `E8003` — both before any (expensive) scan work runs.
+- **Credentials.** Each provider uses its usual credentials: `claude-code` needs `ANTHROPIC_API_KEY` or a logged-in local Claude session; `opencode` manages its own credentials (`opencode` → `/connect`).
+- **Same provider = shared instance.** When the judge provider matches the scan provider (the default when `--judge-provider` is omitted), the scan's provider instance is reused — no second OpenCode server is spawned. The judge model is still validated at startup.
+- **Reporting.** The report's `metadata.judge` field carries `{ provider, model }` for the judge stage, and `agentProvider.models` lists only scan-stage models. Each judged issue also records `judge.provider` and `judge.model`. Scan history records `judgeProvider`/`judgeModel` alongside the combined `models` list.
+- `--judge-provider` without a judge model is a no-op (the stage is enabled by the model) — the CLI warns when it sees this.
+
 ### Verdicts and status effects
 
 | Verdict | Issue `judge.verdict` | Status effect |
@@ -313,7 +332,7 @@ Add `"judge": false` to a check's JSON definition to skip judge evaluation for t
 When the judge stage runs, the scan banner includes a summary line:
 
 ```
-  Judged:        12 issues: 9 true / 2 false / 1 uncertain (judge: claude-opus-4-7)
+  Judged:        12 issues: 9 true / 2 false / 1 uncertain (judge: claude-opus-4-7 via claude-code)
 ```
 
 The `ScanSummary` in the JSON output includes `judgedIssues`, `falsePositives`, `uncertainJudgements`, `flaggedByCheck`, and `flaggedByJudge` counts.

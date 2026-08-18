@@ -3,7 +3,7 @@
  * Uses @anthropic-ai/claude-agent-sdk per spec Section 6.2 / Appendix C.8.
  */
 
-import type { AgentProvider, AgentResponse, ProviderConfig, CheckResponse, ProviderModelInfo, TokenUsage } from './types.js';
+import type { AgentProvider, AgentResponse, ExecuteCheckOptions, ProviderConfig, CheckResponse, ProviderModelInfo, TokenUsage } from './types.js';
 import { DEFAULT_MODEL, FatalProviderError } from './types.js';
 // import { parseAgentResponse } from './response-parser.js';
 import { logProgress, logDebug, logDebugFull, logWarn, createTimer, getLogLevel } from './logging.js';
@@ -203,6 +203,15 @@ export class ClaudeCodeProvider implements AgentProvider {
     this.model = model;
   }
 
+  /**
+   * Validate a model id without changing provider state. Same lenient behavior
+   * as initialize's preflight: throws only when the model is definitively
+   * unsupported; warns and continues when the supported list can't be fetched.
+   */
+  async validateModel(model: string): Promise<void> {
+    await this.validateConfiguredModel(model);
+  }
+
   async listModels(): Promise<readonly ProviderModelInfo[]> {
     if (this._listModelsFn) {
       return await this._listModelsFn();
@@ -280,7 +289,7 @@ export class ClaudeCodeProvider implements AgentProvider {
     instructions: string,
     repositoryPath: string,
     logPrefix?: string,
-    options?: { maxTurns?: number },
+    options?: ExecuteCheckOptions,
   ): Promise<AgentResponse> {
     const queryFn = this._queryFn ?? (await import('@anthropic-ai/claude-agent-sdk')).query;
     const timer = createTimer();
@@ -302,14 +311,14 @@ export class ClaudeCodeProvider implements AgentProvider {
         permissionMode: 'bypassPermissions',
         outputFormat: {
           type: 'json_schema',
-          schema: OUTPUT_SCHEMA,
+          schema: options?.outputSchema ?? OUTPUT_SCHEMA,
         },
       },
     });
 
     // Consume all messages from the async generator to get the result
     let resultText = '';
-    let structuredOutput: CheckResponse | undefined;
+    let structuredOutput: unknown;
     let errorMessage: string | undefined;
     let turnCount = 0;
     let toolCallCount = 0;
@@ -447,7 +456,7 @@ export class ClaudeCodeProvider implements AgentProvider {
           // Extract structured output if available
           const resultMsg = message as {
             result: string;
-            structured_output?: CheckResponse;
+            structured_output?: unknown;
             total_cost_usd?: number;
             usage?: {
               input_tokens: number;
@@ -462,9 +471,10 @@ export class ClaudeCodeProvider implements AgentProvider {
               cacheReadInputTokens?: number;
             }>;
           };
-          if (resultMsg.structured_output) {
+          if (resultMsg.structured_output !== undefined) {
             structuredOutput = resultMsg.structured_output;
-            logDebug(TAG, `${prefix}Structured output: ${structuredOutput.issues.length} issues`);
+            const issues = (structuredOutput as { issues?: unknown }).issues;
+            logDebug(TAG, `${prefix}Structured output received${Array.isArray(issues) ? `: ${issues.length} issues` : ''}`);
           }
           // Extract token usage if available.
           // Prefer modelUsage (camelCase, per-model breakdown) over usage (snake_case, raw API).
@@ -541,8 +551,15 @@ export class ClaudeCodeProvider implements AgentProvider {
     // The response parser (parseAgentResponse) is kept in the codebase as a potential
     // fallback for future use cases (e.g., alternative agent providers that don't support
     // structured output), but this provider always requires structured output.
-    if (structuredOutput) {
-      return { raw: resultText, parsed: structuredOutput, tokenUsage };
+    if (structuredOutput !== undefined) {
+      // `parsed` carries the scan's CheckResponse shape only; calls with a custom
+      // outputSchema (e.g. the judge) read `structured` instead.
+      return {
+        raw: resultText,
+        structured: structuredOutput,
+        ...(options?.outputSchema ? {} : { parsed: structuredOutput as CheckResponse }),
+        tokenUsage,
+      };
     }
 
     // No fallback parsing - structured output is mandatory for this provider.

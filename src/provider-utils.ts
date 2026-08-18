@@ -49,3 +49,17 @@ export const OUTPUT_SCHEMA = {
   required: ['issues'],
   additionalProperties: false,
 } as const;
+
+// JSON schema for the LLM judge stage's verdict calls. Must stay in lockstep
+// with parseJudgeResponse (src/judge.ts): underscored verdict values, numeric
+// confidence in [0, 1], and a rationale string — all required.
+export const JUDGE_OUTPUT_SCHEMA = {
+  type: 'object',
+  properties: {
+    verdict: { type: 'string', enum: ['true_positive', 'false_positive', 'uncertain'] },
+    confidence: { type: 'number', minimum: 0, maximum: 1 },
+    rationale: { type: 'string' },
+  },
+  required: ['verdict', 'confidence', 'rationale'],
+  additionalProperties: false,
+} as const;

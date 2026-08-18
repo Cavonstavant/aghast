@@ -55,6 +55,10 @@ export interface ScanRecord {
   checks: number;
   /** Number of issues reported. */
   issues: number;
+  /** Judge agent provider name when the judge stage ran (may differ from the scan's). */
+  judgeProvider?: string;
+  /** Judge model when the judge stage ran (also included in `models`). */
+  judgeModel?: string;
 }
 
 interface HistoryFile {

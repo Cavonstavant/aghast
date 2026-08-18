@@ -5,7 +5,7 @@
  * This is shipped with the package (unlike the full test mock in tests/mocks/).
  */
 
-import type { AgentProvider, AgentResponse, ProviderConfig, TokenUsage } from './types.js';
+import type { AgentProvider, AgentResponse, ExecuteCheckOptions, ProviderConfig, TokenUsage } from './types.js';
 
 export class MockAgentProvider implements AgentProvider {
   private rawResponse: string;
@@ -28,7 +28,7 @@ export class MockAgentProvider implements AgentProvider {
     _instructions: string,
     _repositoryPath: string,
     _logPrefix?: string,
-    _options?: { maxTurns?: number },
+    _options?: ExecuteCheckOptions,
   ): Promise<AgentResponse> {
     // Test hook: fail the first N calls with a retryable error, then succeed.
     // Lets CLI-level tests prove that a transient provider failure is retried

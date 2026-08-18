@@ -2,6 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { ClaudeCodeProvider, type QueryFn } from '../src/claude-code-provider.js';
 import { FatalProviderError } from '../src/types.js';
+import { OUTPUT_SCHEMA, JUDGE_OUTPUT_SCHEMA } from '../src/provider-utils.js';
 
 /**
  * Build a fake SDK query function that yields the given messages as an async iterable.
@@ -813,5 +814,79 @@ describe('ClaudeCodeProvider: authentication resolution', () => {
       assert.ok(result.tokenUsage?.reportedCost, 'Should have reportedCost');
       assert.equal(result.tokenUsage!.reportedCost!.coveredBySubscription, true);
     });
+  });
+});
+
+describe('ClaudeCodeProvider: per-call output schema', () => {
+  it('sends the scan OUTPUT_SCHEMA by default and populates parsed + structured', async () => {
+    let capturedOptions: Record<string, unknown> | undefined;
+    const capturingQueryFn: QueryFn = function* (params) {
+      capturedOptions = params.options as Record<string, unknown>;
+      yield successResult();
+    } as unknown as QueryFn;
+
+    const provider = new ClaudeCodeProvider({ _queryFn: capturingQueryFn });
+    await provider.initialize({ apiKey: 'test-key' });
+    const response = await provider.executeCheck('test prompt', '/tmp/repo');
+
+    const outputFormat = capturedOptions?.outputFormat as { schema: unknown };
+    assert.deepEqual(outputFormat.schema, OUTPUT_SCHEMA);
+    assert.deepEqual(response.parsed, { issues: [] });
+    assert.deepEqual(response.structured, { issues: [] });
+  });
+
+  it('sends a custom outputSchema and returns structured without parsed', async () => {
+    const verdict = { verdict: 'false_positive', confidence: 0.9, rationale: 'guarded upstream' };
+    let capturedOptions: Record<string, unknown> | undefined;
+    const capturingQueryFn: QueryFn = function* (params) {
+      capturedOptions = params.options as Record<string, unknown>;
+      yield {
+        type: 'result',
+        subtype: 'success',
+        result: JSON.stringify(verdict),
+        structured_output: verdict,
+      };
+    } as unknown as QueryFn;
+
+    const provider = new ClaudeCodeProvider({ _queryFn: capturingQueryFn });
+    await provider.initialize({ apiKey: 'test-key' });
+    const response = await provider.executeCheck('judge prompt', '/tmp/repo', undefined, {
+      outputSchema: JUDGE_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
+    });
+
+    const outputFormat = capturedOptions?.outputFormat as { schema: unknown };
+    assert.deepEqual(outputFormat.schema, JUDGE_OUTPUT_SCHEMA);
+    assert.deepEqual(response.structured, verdict);
+    assert.equal(response.parsed, undefined, 'parsed carries the scan CheckResponse shape only');
+  });
+});
+
+describe('ClaudeCodeProvider: validateModel', () => {
+  it('accepts a supported model without changing the configured model', async () => {
+    const provider = new ClaudeCodeProvider({
+      _listSupportedModelsFn: async () => [{ id: 'haiku' }, { id: 'sonnet' }],
+    });
+    await provider.initialize({ apiKey: 'test-key', model: 'haiku' });
+
+    await provider.validateModel('sonnet');
+    assert.equal(provider.getModelName(), 'haiku', 'validateModel must not mutate provider state');
+  });
+
+  it('rejects an unsupported model with the available list', async () => {
+    const provider = new ClaudeCodeProvider({
+      _listSupportedModelsFn: async () => [{ id: 'haiku' }, { id: 'sonnet' }],
+    });
+    await provider.initialize({ apiKey: 'test-key', model: 'haiku' });
+
+    await assert.rejects(
+      () => provider.validateModel('junk'),
+      (err: Error) => {
+        assert.ok(err instanceof FatalProviderError);
+        assert.match(err.message, /does not support configured model "junk"/);
+        assert.match(err.message, /Available models: haiku, sonnet/);
+        return true;
+      },
+    );
+    assert.equal(provider.getModelName(), 'haiku');
   });
 });

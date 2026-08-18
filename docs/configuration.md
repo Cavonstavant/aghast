@@ -587,8 +587,8 @@ The built-in `config/pricing.json` provides per-million-token rates for the defa
 | `pricing.currency`              | `string`   | `USD` | Currency for cost estimates |
 | `pricing.models`                | `object`   | (built-in) | Per-model overrides: `{ "<model>": { "inputPerMillion": <usd>, "outputPerMillion": <usd> } }`. Merges with built-in defaults |
 
-| `judge.model`               | `string`   | (none, stage disabled) | Enable the LLM judge stage using this model. The judge re-evaluates every finding post-scan and annotates it with a verdict, confidence, and rationale. CLI `--judge-model` takes precedence |
-| `judge.provider`            | `string`   | (scan provider) | Agent provider for the judge stage. Defaults to the scan provider if omitted |
+| `judge.model`               | `string`   | (none, stage disabled) | Enable the LLM judge stage using this model. The judge re-evaluates every finding post-scan and annotates it with a verdict, confidence, and rationale. Must be written in **`judge.provider`'s model dialect** (bare model id for `claude-code`, `providerID/modelID` for `opencode`). CLI `--judge-model` takes precedence |
+| `judge.provider`            | `string`   | (scan provider) | Agent provider for the judge stage; may differ from the scan's (see [Using a different provider for the judge](scanning.md#using-a-different-provider-for-the-judge)). Defaults to the scan provider if omitted, in which case the scan's provider instance is reused. Validated at startup (`E8002`/`E8003`) before the scan runs |
 | `judge.concurrency`         | `number`   | `5` | Max parallel judge calls per scan |
 | `judge.dropFalsePositives`  | `boolean`  | `false` | Remove issues confirmed as false positives from the output. If a check loses all its issues, it becomes PASS |
 | `judge.minConfidence`       | `number`   | (none) | Confidence threshold (0–1). `true_positive` verdicts below this value are demoted to `uncertain` |

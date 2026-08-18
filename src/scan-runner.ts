@@ -1104,6 +1104,8 @@ export interface MultiScanOutcome {
   budgetAbortReason?: string;
   /** Judge model name when the judge stage ran. */
   judgeModel?: string;
+  /** Judge agent provider name when the judge stage was enabled. */
+  judgeProvider?: string;
   /** Judge verdicts summary when the judge stage ran. */
   judgeSummary?: { judgedIssues: number; falsePositives: number; uncertainJudgements: number };
 }
@@ -1288,9 +1290,13 @@ export async function runMultiScanWithCost(options: MultiScanOptions): Promise<M
   // results still benefit from judging). Budget abort during the judge stage
   // sets budgetAborted=true; partially-judged issues retain their verdicts.
   let judgeSummary: { judgedIssues: number; falsePositives: number; uncertainJudgements: number } | undefined;
+  // Whether the judge stage actually executed (enabled AND there were issues to
+  // judge). The judge model joins the outcome's model list only in that case —
+  // and never joins the report's agentProvider.models, which is scan-stage-only
+  // now that the judge may run on a different provider.
+  let judgeRan = false;
   if (options.judge && allIssues.length > 0) {
-    // Only record the judge model when the judge actually runs (allIssues.length > 0)
-    modelsUsed.add(options.judge.model);
+    judgeRan = true;
     // Build a map of checkId → { check, instructions } for judge prompt context
     const checksById = new Map<string, { check: { judge?: boolean }; instructions: string | undefined }>();
     for (const { check, details } of checks) {
@@ -1309,14 +1315,24 @@ export async function runMultiScanWithCost(options: MultiScanOptions): Promise<M
     }
 
     try {
-      // Share the scan's resolved retry settings and breaker with the judge, so
-      // opting into retry covers the judge's AI calls too rather than leaving
-      // them as the one unprotected call site.
+      // Share the scan's resolved retry settings with the judge, so opting into
+      // retry covers the judge's AI calls too rather than leaving them as the
+      // one unprotected call site. The breaker, however, is the judge's own:
+      // the judge may run on a different provider than the scan, and even on
+      // the same provider it runs strictly after the check loop — a breaker
+      // opened by scan-time failures says nothing about provider health now,
+      // and sharing it would turn a scan-time outage into blanket
+      // CircuitOpenError verdicts for every finding.
+      const judgeBreaker = isRetryEnabled(retryOptions.maxAttempts)
+        ? new CircuitBreaker({
+            threshold: options.retry?.circuitBreakerThreshold ?? DEFAULT_CIRCUIT_BREAKER_THRESHOLD,
+          })
+        : undefined;
       await runJudge(
         allIssues,
         checksById,
         repositoryPath,
-        { ...options.judge, retry: retryOptions, breaker: scanBreaker },
+        { ...options.judge, retry: retryOptions, breaker: judgeBreaker },
         costTracker,
       );
     } catch (err) {
@@ -1413,17 +1429,36 @@ export async function runMultiScanWithCost(options: MultiScanOptions): Promise<M
     };
   }
 
+  // Attach judge stage attribution whenever the stage was enabled — the judge
+  // may run on a different provider than the scan, so it gets its own metadata
+  // block rather than being folded into agentProvider.
+  if (options.judge) {
+    results.metadata = {
+      ...(results.metadata ?? {}),
+      judge: {
+        provider: options.judge.providerName,
+        model: options.judge.model,
+      },
+    };
+  }
+
+  // The outcome's model list covers every model the scan spent tokens on
+  // (history/stats attribution), so the judge model joins it when the judge ran.
+  const allModelsUsed = new Set(modelsUsed);
+  if (judgeRan && options.judge) allModelsUsed.add(options.judge.model);
+
   return {
     results,
     totalCostUsd: costTracker.totalCostUsd,
     currency: options.pricing?.currency ?? 'USD',
-    models: [...modelsUsed],
+    models: [...allModelsUsed],
     costSource: costTracker.lastCostSource,
     costReportedBy: costTracker.lastCostReportedBy,
     costCoveredBySubscription: costTracker.lastCostCoveredBySubscription,
     budgetAborted,
     budgetAbortReason,
     judgeModel: options.judge?.model,
+    judgeProvider: options.judge?.providerName,
     judgeSummary,
   };
 }
